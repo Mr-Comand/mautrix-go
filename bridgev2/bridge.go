@@ -54,6 +54,9 @@ type Bridge struct {
 
 	wakeupBackfillQueue chan struct{}
 	stopBackfillQueue   *exsync.Event
+
+	BackgroundCtx       context.Context
+	cancelBackgroundCtx context.CancelFunc
 }
 
 func NewBridge(
@@ -134,7 +137,7 @@ func (br *Bridge) RunOnce(ctx context.Context, loginID networkid.UserLoginID, pa
 		if err != nil {
 			return err
 		}
-		defer br.Stop()
+		defer br.StopWithTimeout(5 * time.Second)
 		select {
 		case <-time.After(20 * time.Second):
 		case <-ctx.Done():
@@ -142,7 +145,7 @@ func (br *Bridge) RunOnce(ctx context.Context, loginID networkid.UserLoginID, pa
 		return nil
 	}
 
-	defer br.stop(true)
+	defer br.stop(true, 5*time.Second)
 	login, err := br.GetExistingUserLoginByID(ctx, loginID)
 	if err != nil {
 		return fmt.Errorf("failed to get user login: %w", err)
@@ -153,7 +156,7 @@ func (br *Bridge) RunOnce(ctx context.Context, loginID networkid.UserLoginID, pa
 	if !ok {
 		br.Log.Warn().Msg("Network connector doesn't implement background mode, using fallback mechanism for RunOnce")
 		login.Client.Connect(ctx)
-		defer login.Disconnect(nil)
+		defer login.DisconnectWithTimeout(5 * time.Second)
 		select {
 		case <-time.After(20 * time.Second):
 		case <-ctx.Done():
@@ -167,6 +170,9 @@ func (br *Bridge) RunOnce(ctx context.Context, loginID networkid.UserLoginID, pa
 
 func (br *Bridge) StartConnectors(ctx context.Context) error {
 	br.Log.Info().Msg("Starting bridge")
+	if br.BackgroundCtx == nil || br.BackgroundCtx.Err() != nil {
+		br.BackgroundCtx, br.cancelBackgroundCtx = context.WithCancel(context.Background())
+	}
 
 	if !br.ExternallyManagedDB {
 		err := br.DB.Upgrade(ctx)
@@ -313,22 +319,34 @@ func (br *Bridge) StartLogins(ctx context.Context) error {
 }
 
 func (br *Bridge) Stop() {
-	br.stop(false)
+	br.stop(false, 0)
 }
 
-func (br *Bridge) stop(isRunOnce bool) {
+func (br *Bridge) StopWithTimeout(timeout time.Duration) {
+	br.stop(false, timeout)
+}
+
+func (br *Bridge) stop(isRunOnce bool, timeout time.Duration) {
 	br.Log.Info().Msg("Shutting down bridge")
+	br.DisappearLoop.Stop()
 	br.stopBackfillQueue.Set()
-	br.Matrix.Stop()
+	br.Matrix.PreStop()
 	if !isRunOnce {
 		br.cacheLock.Lock()
 		var wg sync.WaitGroup
 		wg.Add(len(br.userLoginsByID))
 		for _, login := range br.userLoginsByID {
-			go login.Disconnect(wg.Done)
+			go func() {
+				login.DisconnectWithTimeout(timeout)
+				wg.Done()
+			}()
 		}
-		wg.Wait()
 		br.cacheLock.Unlock()
+		wg.Wait()
+	}
+	br.Matrix.Stop()
+	if br.cancelBackgroundCtx != nil {
+		br.cancelBackgroundCtx()
 	}
 	if stopNet, ok := br.Network.(StoppableNetwork); ok {
 		stopNet.Stop()

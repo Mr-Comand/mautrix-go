@@ -31,6 +31,7 @@ type MatrixCapabilities struct {
 type MatrixConnector interface {
 	Init(*Bridge)
 	Start(ctx context.Context) error
+	PreStop()
 	Stop()
 
 	GetCapabilities() *MatrixCapabilities
@@ -168,6 +169,10 @@ type MatrixAPI interface {
 
 	TagRoom(ctx context.Context, roomID id.RoomID, tag event.RoomTag, isTagged bool) error
 	MuteRoom(ctx context.Context, roomID id.RoomID, until time.Time) error
+}
+
+type StreamOrderReadingMatrixAPI interface {
+	MarkStreamOrderRead(ctx context.Context, roomID id.RoomID, streamOrder int64, ts time.Time) error
 }
 
 type MarkAsDMMatrixAPI interface {

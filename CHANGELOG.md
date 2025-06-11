@@ -1,3 +1,44 @@
+## v0.24.0 (2025-05-16)
+
+* *(commands)* Added generic framework for implementing bot commands.
+* *(client)* Added support for specifying maximum number of HTTP retries using
+  a context value instead of having to call `MakeFullRequest` manually.
+* *(client,federation)* Added methods for fetching room directories.
+* *(federation)* Added support for server side of request authentication.
+* *(synapseadmin)* Added wrapper for the account suspension endpoint.
+* *(format)* Added method for safely wrapping a string in markdown inline code.
+* *(crypto)* Added method to import key backup without persisting to database,
+  to allow the client more control over the process.
+* *(bridgev2)* Added viewing chat interface to signal when the user is viewing
+  a given chat.
+* *(bridgev2)* Added option to pass through transaction ID from client when
+  sending messages to remote network.
+* *(crypto)* Fixed unnecessary error log when decrypting dummy events used for
+  unwedging Olm sessions.
+* *(crypto)* Fixed `forwarding_curve25519_key_chain` not being set consistently
+  when backing up keys.
+* *(event)* Fixed marshaling legacy VoIP events with no version field.
+* *(bridgev2)* Fixed disappearing message references not being deleted when the
+  portal is deleted.
+* *(bridgev2)* Fixed read receipt bridging not ignoring fake message entries
+  and causing unnecessary error logs.
+
+## v0.23.3 (2025-04-16)
+
+* *(commands)* Added generic command processing framework for bots.
+* *(client)* Added `allowed_room_ids` field to room summary responses
+  (thanks to [@nexy7574] in [#367]).
+* *(bridgev2)* Added support for custom timeouts on outgoing messages which have
+  to wait for a remote echo.
+* *(bridgev2)* Added automatic typing stop event if the ghost user had sent a
+  typing event before a message.
+* *(bridgev2)* The saved management room is now cleared if the user leaves the
+  room, allowing the next DM to be automatically marked as a management room.
+* *(bridge)* Removed deprecated fallback package for bridge statuses.
+  The status package is now only available under bridgev2.
+
+[#367]: https://github.com/mautrix/go/pull/367
+
 ## v0.23.2 (2025-03-16)
 
 * **Breaking change *(bridge)*** Removed legacy bridge module.

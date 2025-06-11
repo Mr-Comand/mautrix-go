@@ -76,7 +76,9 @@ func (bsq *BridgeStateQueue) loop() {
 
 func (bsq *BridgeStateQueue) sendNotice(ctx context.Context, state status.BridgeState) {
 	noticeConfig := bsq.bridge.Config.BridgeStatusNotices
-	isError := state.StateEvent == status.StateBadCredentials || state.StateEvent == status.StateUnknownError
+	isError := state.StateEvent == status.StateBadCredentials ||
+		state.StateEvent == status.StateUnknownError ||
+		state.UserAction == status.UserActionOpenNative
 	sendNotice := noticeConfig == "all" || (noticeConfig == "errors" &&
 		(isError || (bsq.errorSent && state.StateEvent == status.StateConnected)))
 	if !sendNotice {
@@ -87,7 +89,11 @@ func (bsq *BridgeStateQueue) sendNotice(ctx context.Context, state status.Bridge
 		bsq.login.Log.Err(err).Msg("Failed to get management room")
 		return
 	}
-	message := fmt.Sprintf("State update for %s: `%s`", bsq.login.RemoteName, state.StateEvent)
+	name := bsq.login.RemoteName
+	if name == "" {
+		name = fmt.Sprintf("`%s`", bsq.login.ID)
+	}
+	message := fmt.Sprintf("State update for %s: `%s`", name, state.StateEvent)
 	if state.Error != "" {
 		message += fmt.Sprintf(" (`%s`)", state.Error)
 	}

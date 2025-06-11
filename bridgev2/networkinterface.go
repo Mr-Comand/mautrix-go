@@ -77,6 +77,19 @@ type EventSender struct {
 	ForceDMUser bool
 }
 
+func (es EventSender) MarshalZerologObject(evt *zerolog.Event) {
+	evt.Str("user_id", string(es.Sender))
+	if string(es.SenderLogin) != string(es.Sender) {
+		evt.Str("sender_login", string(es.SenderLogin))
+	}
+	if es.IsFromMe {
+		evt.Bool("is_from_me", true)
+	}
+	if es.ForceDMUser {
+		evt.Bool("force_dm_user", true)
+	}
+}
+
 type ConvertedMessage struct {
 	ReplyTo    *networkid.MessageOptionalPartID
 	ThreadRoot *networkid.MessageID
@@ -259,6 +272,11 @@ type IdentifierValidatingNetwork interface {
 	ValidateUserID(id networkid.UserID) bool
 }
 
+type TransactionIDGeneratingNetwork interface {
+	NetworkConnector
+	GenerateTransactionID(userID id.UserID, roomID id.RoomID, eventType event.Type) networkid.RawTransactionID
+}
+
 type PortalBridgeInfoFillingNetwork interface {
 	NetworkConnector
 	FillPortalBridgeInfo(portal *Portal, content *event.BridgeEventContent)
@@ -380,6 +398,13 @@ type BackgroundSyncingNetworkAPI interface {
 	// The client should connect to the remote network, handle pending messages, and then disconnect.
 	// This call should block until the entire sync is complete and the client is disconnected.
 	ConnectBackground(ctx context.Context, params *ConnectBackgroundParams) error
+}
+
+// CredentialExportingNetworkAPI is an optional interface that networks connectors can implement to support export of
+// the credentials associated with that login. Credential type is bridge specific.
+type CredentialExportingNetworkAPI interface {
+	NetworkAPI
+	ExportCredentials(ctx context.Context) any
 }
 
 // FetchMessagesParams contains the parameters for a message history pagination request.
@@ -581,6 +606,16 @@ type ReadReceiptHandlingNetworkAPI interface {
 	// Network connectors must gracefully handle [MatrixReadReceipt.ExactMessage] being nil.
 	// The exact handling is up to the network connector.
 	HandleMatrixReadReceipt(ctx context.Context, msg *MatrixReadReceipt) error
+}
+
+// ChatViewingNetworkAPI is an optional interface that network connectors can implement to handle viewing chat status.
+type ChatViewingNetworkAPI interface {
+	NetworkAPI
+	// HandleMatrixViewingChat is called when the user opens a portal room.
+	// This will never be called by the standard appservice connector,
+	// as Matrix doesn't have any standard way of signaling chat open status.
+	// Clients are expected to call this every 5 seconds. There is no signal for closing a chat.
+	HandleMatrixViewingChat(ctx context.Context, msg *MatrixViewingChat) error
 }
 
 // TypingHandlingNetworkAPI is an optional interface that network connectors can implement to handle typing events.
@@ -1102,6 +1137,11 @@ type RemoteReadReceipt interface {
 	GetReadUpTo() time.Time
 }
 
+type RemoteReadReceiptWithStreamOrder interface {
+	RemoteReadReceipt
+	GetReadUpToStreamOrder() int64
+}
+
 type RemoteDeliveryReceipt interface {
 	RemoteEvent
 	GetReceiptTargets() []networkid.MessageID
@@ -1151,6 +1191,8 @@ type MatrixEventBase[ContentType any] struct {
 
 	// The original sender user ID. Only present in case the event is being relayed (and Sender is not the same user).
 	OrigSender *OrigSender
+
+	InputTransactionID networkid.RawTransactionID
 }
 
 type MatrixMessage struct {
@@ -1233,6 +1275,11 @@ type MatrixTyping struct {
 	Portal   *Portal
 	IsTyping bool
 	Type     TypingType
+}
+
+type MatrixViewingChat struct {
+	// The portal that the user is viewing. This will be nil when the user switches to a chat from a different bridge.
+	Portal *Portal
 }
 
 type MatrixMarkedUnread = MatrixRoomMeta[*event.MarkedUnreadEventContent]

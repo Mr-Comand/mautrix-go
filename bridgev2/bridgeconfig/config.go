@@ -58,25 +58,27 @@ type CleanupOnLogouts struct {
 }
 
 type BridgeConfig struct {
-	CommandPrefix           string           `yaml:"command_prefix"`
-	PersonalFilteringSpaces bool             `yaml:"personal_filtering_spaces"`
-	PrivateChatPortalMeta   bool             `yaml:"private_chat_portal_meta"`
-	AsyncEvents             bool             `yaml:"async_events"`
-	SplitPortals            bool             `yaml:"split_portals"`
-	ResendBridgeInfo        bool             `yaml:"resend_bridge_info"`
-	NoBridgeInfoStateKey    bool             `yaml:"no_bridge_info_state_key"`
-	BridgeStatusNotices     string           `yaml:"bridge_status_notices"`
-	BridgeMatrixLeave       bool             `yaml:"bridge_matrix_leave"`
-	BridgeNotices           bool             `yaml:"bridge_notices"`
-	TagOnlyOnCreate         bool             `yaml:"tag_only_on_create"`
-	OnlyBridgeTags          []event.RoomTag  `yaml:"only_bridge_tags"`
-	MuteOnlyOnCreate        bool             `yaml:"mute_only_on_create"`
-	EditInsteadOfDelete     bool             `yaml:"edit_instead_of_delete"`
-	OutgoingMessageReID     bool             `yaml:"outgoing_message_re_id"`
-	CleanupOnLogout         CleanupOnLogouts `yaml:"cleanup_on_logout"`
-	Relay                   RelayConfig      `yaml:"relay"`
-	Permissions             PermissionConfig `yaml:"permissions"`
-	Backfill                BackfillConfig   `yaml:"backfill"`
+	CommandPrefix             string           `yaml:"command_prefix"`
+	PersonalFilteringSpaces   bool             `yaml:"personal_filtering_spaces"`
+	PrivateChatPortalMeta     bool             `yaml:"private_chat_portal_meta"`
+	AsyncEvents               bool             `yaml:"async_events"`
+	SplitPortals              bool             `yaml:"split_portals"`
+	ResendBridgeInfo          bool             `yaml:"resend_bridge_info"`
+	NoBridgeInfoStateKey      bool             `yaml:"no_bridge_info_state_key"`
+	BridgeStatusNotices       string           `yaml:"bridge_status_notices"`
+	BridgeMatrixLeave         bool             `yaml:"bridge_matrix_leave"`
+	BridgeNotices             bool             `yaml:"bridge_notices"`
+	TagOnlyOnCreate           bool             `yaml:"tag_only_on_create"`
+	OnlyBridgeTags            []event.RoomTag  `yaml:"only_bridge_tags"`
+	MuteOnlyOnCreate          bool             `yaml:"mute_only_on_create"`
+	DeduplicateMatrixMessages bool             `yaml:"deduplicate_matrix_messages"`
+	CrossRoomReplies          bool             `yaml:"cross_room_replies"`
+	EditInsteadOfDelete       bool             `yaml:"edit_instead_of_delete"`
+	OutgoingMessageReID       bool             `yaml:"outgoing_message_re_id"`
+	CleanupOnLogout           CleanupOnLogouts `yaml:"cleanup_on_logout"`
+	Relay                     RelayConfig      `yaml:"relay"`
+	Permissions               PermissionConfig `yaml:"permissions"`
+	Backfill                  BackfillConfig   `yaml:"backfill"`
 }
 
 type MatrixConfig struct {
@@ -95,9 +97,10 @@ type AnalyticsConfig struct {
 }
 
 type ProvisioningConfig struct {
-	Prefix         string `yaml:"prefix"`
-	SharedSecret   string `yaml:"shared_secret"`
-	DebugEndpoints bool   `yaml:"debug_endpoints"`
+	Prefix                 string `yaml:"prefix"`
+	SharedSecret           string `yaml:"shared_secret"`
+	DebugEndpoints         bool   `yaml:"debug_endpoints"`
+	EnableSessionTransfers bool   `yaml:"enable_session_transfers"`
 }
 
 type DirectMediaConfig struct {

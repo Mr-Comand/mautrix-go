@@ -302,7 +302,7 @@ func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) {
 
 func (portal *Portal) eventLoop() {
 	if cfg := portal.Bridge.Network.GetCapabilities().OutgoingMessageTimeouts; cfg != nil {
-		ctx, cancel := context.WithCancel(portal.Log.WithContext(context.Background()))
+		ctx, cancel := context.WithCancel(portal.Log.WithContext(portal.Bridge.BackgroundCtx))
 		go portal.pendingMessageTimeoutLoop(ctx, cfg)
 		defer cancel()
 	}
@@ -329,7 +329,9 @@ func (portal *Portal) handleSingleEventAsync(idx int, rawEvt any) {
 			handleDuration = time.Since(start)
 			close(doneCh)
 			if backgrounded.Load() {
-				log.Debug().Stringer("duration", handleDuration).
+				log.Debug().
+					Time("started_at", start).
+					Stringer("duration", handleDuration).
 					Msg("Event that took too long finally finished handling")
 			}
 		})
@@ -339,15 +341,21 @@ func (portal *Portal) handleSingleEventAsync(idx int, rawEvt any) {
 			select {
 			case <-doneCh:
 				if i > 0 {
-					log.Debug().Stringer("duration", handleDuration).
+					log.Debug().
+						Time("started_at", start).
+						Stringer("duration", handleDuration).
 						Msg("Event that took long finished handling")
 				}
 				return
 			case <-tick.C:
-				log.Warn().Msg("Event handling is taking long")
+				log.Warn().
+					Time("started_at", start).
+					Msg("Event handling is taking long")
 			}
 		}
-		log.Warn().Msg("Event handling is taking too long, continuing in background")
+		log.Warn().
+			Time("started_at", start).
+			Msg("Event handling is taking too long, continuing in background")
 		backgrounded.Store(true)
 	}
 }
@@ -372,10 +380,28 @@ func (portal *Portal) getEventCtxWithLog(rawEvt any, idx int) context.Context {
 			Str("source_id", string(evt.source.ID)).
 			Stringer("bridge_evt_type", evt.evtType)
 		logWith = evt.evt.AddLogContext(logWith)
+		if remoteSender := evt.evt.GetSender(); remoteSender.Sender != "" || remoteSender.IsFromMe {
+			logWith = logWith.Object("remote_sender", remoteSender)
+		}
+		if remoteMsg, ok := evt.evt.(RemoteMessage); ok {
+			if remoteMsgID := remoteMsg.GetID(); remoteMsgID != "" {
+				logWith = logWith.Str("remote_message_id", string(remoteMsgID))
+			}
+		}
+		if remoteMsg, ok := evt.evt.(RemoteEventWithTargetMessage); ok {
+			if targetMsgID := remoteMsg.GetTargetMessage(); targetMsgID != "" {
+				logWith = logWith.Str("remote_target_message_id", string(targetMsgID))
+			}
+		}
+		if remoteMsg, ok := evt.evt.(RemoteEventWithStreamOrder); ok {
+			if remoteStreamOrder := remoteMsg.GetStreamOrder(); remoteStreamOrder != 0 {
+				logWith = logWith.Int64("remote_stream_order", remoteStreamOrder)
+			}
+		}
 	case *portalCreateEvent:
 		return evt.ctx
 	}
-	return logWith.Logger().WithContext(context.Background())
+	return logWith.Logger().WithContext(portal.Bridge.BackgroundCtx)
 }
 
 func (portal *Portal) handleSingleEvent(ctx context.Context, rawEvt any, doneCallback func()) {
@@ -811,6 +837,13 @@ func (portal *Portal) checkMessageContentCaps(ctx context.Context, caps *event.R
 	return true
 }
 
+func (portal *Portal) parseInputTransactionID(origSender *OrigSender, evt *event.Event) networkid.RawTransactionID {
+	if origSender != nil || !strings.HasPrefix(evt.ID.String(), database.NetworkTxnMXIDPrefix) {
+		return ""
+	}
+	return networkid.RawTransactionID(strings.TrimPrefix(evt.ID.String(), database.NetworkTxnMXIDPrefix))
+}
+
 func (portal *Portal) handleMatrixMessage(ctx context.Context, sender *UserLogin, origSender *OrigSender, evt *event.Event) {
 	log := zerolog.Ctx(ctx)
 	var relatesTo *event.RelatesTo
@@ -938,10 +971,24 @@ func (portal *Portal) handleMatrixMessage(ctx context.Context, sender *UserLogin
 			Content:    msgContent,
 			OrigSender: origSender,
 			Portal:     portal,
+
+			InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 		},
 		ThreadRoot: threadRoot,
 		ReplyTo:    replyTo,
 	}
+	if portal.Bridge.Config.DeduplicateMatrixMessages {
+		if part, err := portal.Bridge.DB.Message.GetPartByTxnID(ctx, portal.Receiver, evt.ID, wrappedMsgEvt.InputTransactionID); err != nil {
+			log.Err(err).Msg("Failed to check db if message is already sent")
+		} else if part != nil {
+			log.Debug().
+				Stringer("message_mxid", part.MXID).
+				Stringer("input_event_id", evt.ID).
+				Msg("Message already sent, ignoring")
+			return
+		}
+	}
+
 	var resp *MatrixMessageResponse
 	if msgContent != nil {
 		resp, err = sender.Client.HandleMatrixMessage(ctx, wrappedMsgEvt)
@@ -1082,6 +1129,9 @@ func (evt *MatrixMessage) fillDBMessage(message *database.Message) *database.Mes
 	if message.SenderMXID == "" {
 		message.SenderMXID = evt.Event.Sender
 	}
+	if message.SendTxnID != "" {
+		message.SendTxnID = evt.InputTransactionID
+	}
 	return message
 }
 
@@ -1173,6 +1223,8 @@ func (portal *Portal) handleMatrixEdit(ctx context.Context, sender *UserLogin, o
 			Content:    content,
 			OrigSender: origSender,
 			Portal:     portal,
+
+			InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 		},
 		EditTarget: editTarget,
 	})
@@ -1224,6 +1276,8 @@ func (portal *Portal) handleMatrixReaction(ctx context.Context, sender *UserLogi
 			Event:   evt,
 			Content: content,
 			Portal:  portal,
+
+			InputTransactionID: portal.parseInputTransactionID(nil, evt),
 		},
 		TargetMessage: reactionTarget,
 	}
@@ -1380,6 +1434,8 @@ func handleMatrixRoomMeta[APIType any, ContentType any](
 			Content:    content,
 			Portal:     portal,
 			OrigSender: origSender,
+
+			InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 		},
 		PrevContent: prevContent,
 	})
@@ -1501,6 +1557,8 @@ func (portal *Portal) handleMatrixMembership(
 				Content:    content,
 				Portal:     portal,
 				OrigSender: origSender,
+
+				InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 			},
 			PrevContent: prevContent,
 		},
@@ -1565,6 +1623,8 @@ func (portal *Portal) handleMatrixPowerLevels(
 				Content:    content,
 				Portal:     portal,
 				OrigSender: origSender,
+
+				InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 			},
 			PrevContent: prevContent,
 		},
@@ -1651,6 +1711,8 @@ func (portal *Portal) handleMatrixRedaction(ctx context.Context, sender *UserLog
 				Content:    content,
 				Portal:     portal,
 				OrigSender: origSender,
+
+				InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 			},
 			TargetMessage: redactionTargetMsg,
 		})
@@ -1671,6 +1733,8 @@ func (portal *Portal) handleMatrixRedaction(ctx context.Context, sender *UserLog
 				Content:    content,
 				Portal:     portal,
 				OrigSender: origSender,
+
+				InputTransactionID: portal.parseInputTransactionID(origSender, evt),
 			},
 			TargetReaction: redactionTargetReaction,
 		})
@@ -1847,7 +1911,7 @@ func (portal *Portal) getRelationMeta(ctx context.Context, currentMsg networkid.
 		if err != nil {
 			log.Err(err).Msg("Failed to get reply target message from database")
 		} else if replyTo == nil {
-			if isBatchSend {
+			if isBatchSend || portal.Bridge.Config.OutgoingMessageReID {
 				// This is somewhat evil
 				replyTo = &database.Message{
 					MXID: portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, portal.PortalKey, replyToPtr.MessageID, ptr.Val(replyToPtr.PartID)),
@@ -1862,7 +1926,7 @@ func (portal *Portal) getRelationMeta(ctx context.Context, currentMsg networkid.
 		if err != nil {
 			log.Err(err).Msg("Failed to get thread root message from database")
 		} else if threadRoot == nil {
-			if isBatchSend {
+			if isBatchSend || portal.Bridge.Config.OutgoingMessageReID {
 				threadRoot = &database.Message{
 					MXID: portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, portal.PortalKey, *threadRootPtr, ""),
 				}
@@ -1879,7 +1943,7 @@ func (portal *Portal) getRelationMeta(ctx context.Context, currentMsg networkid.
 	return
 }
 
-func (portal *Portal) applyRelationMeta(content *event.MessageEventContent, replyTo, threadRoot, prevThreadEvent *database.Message) {
+func (portal *Portal) applyRelationMeta(ctx context.Context, content *event.MessageEventContent, replyTo, threadRoot, prevThreadEvent *database.Message) {
 	if content.Mentions == nil {
 		content.Mentions = &event.Mentions{}
 	}
@@ -1887,7 +1951,24 @@ func (portal *Portal) applyRelationMeta(content *event.MessageEventContent, repl
 		content.GetRelatesTo().SetThread(threadRoot.MXID, prevThreadEvent.MXID)
 	}
 	if replyTo != nil {
-		content.GetRelatesTo().SetReplyTo(replyTo.MXID)
+		crossRoom := replyTo.Room != portal.PortalKey
+		if !crossRoom || portal.Bridge.Config.CrossRoomReplies {
+			content.GetRelatesTo().SetReplyTo(replyTo.MXID)
+		}
+		if crossRoom && portal.Bridge.Config.CrossRoomReplies {
+			targetPortal, err := portal.Bridge.GetExistingPortalByKey(ctx, replyTo.Room)
+			if err != nil {
+				zerolog.Ctx(ctx).Err(err).
+					Object("target_portal_key", replyTo.Room).
+					Msg("Failed to get cross-room reply portal")
+			} else if targetPortal == nil || targetPortal.MXID == "" {
+				zerolog.Ctx(ctx).Warn().
+					Object("target_portal_key", replyTo.Room).
+					Msg("Cross-room reply portal not found")
+			} else {
+				content.RelatesTo.InReplyTo.UnstableRoomID = targetPortal.MXID
+			}
+		}
 		content.Mentions.Add(replyTo.SenderMXID)
 	}
 }
@@ -1911,7 +1992,7 @@ func (portal *Portal) sendConvertedMessage(
 	replyTo, threadRoot, prevThreadEvent := portal.getRelationMeta(ctx, id, converted.ReplyTo, converted.ThreadRoot, false)
 	output := make([]*database.Message, 0, len(converted.Parts))
 	for i, part := range converted.Parts {
-		portal.applyRelationMeta(part.Content, replyTo, threadRoot, prevThreadEvent)
+		portal.applyRelationMeta(ctx, part.Content, replyTo, threadRoot, prevThreadEvent)
 		dbMessage := &database.Message{
 			ID:               id,
 			PartID:           part.ID,
@@ -2681,10 +2762,10 @@ func (portal *Portal) redactMessageParts(ctx context.Context, parts []*database.
 }
 
 func (portal *Portal) handleRemoteReadReceipt(ctx context.Context, source *UserLogin, evt RemoteReadReceipt) {
-	// TODO exclude fake mxids
 	log := zerolog.Ctx(ctx)
 	var err error
 	var lastTarget *database.Message
+	readUpTo := evt.GetReadUpTo()
 	if lastTargetID := evt.GetLastReceiptTarget(); lastTargetID != "" {
 		lastTarget, err = portal.Bridge.DB.Message.GetLastPartByID(ctx, portal.Receiver, lastTargetID)
 		if err != nil {
@@ -2694,6 +2775,13 @@ func (portal *Portal) handleRemoteReadReceipt(ctx context.Context, source *UserL
 		} else if lastTarget == nil {
 			log.Debug().Str("last_target_id", string(lastTargetID)).
 				Msg("Last target message not found")
+		} else if lastTarget.HasFakeMXID() {
+			log.Debug().Str("last_target_id", string(lastTargetID)).
+				Msg("Last target message is fake")
+			if readUpTo.IsZero() {
+				readUpTo = lastTarget.Timestamp
+			}
+			lastTarget = nil
 		}
 	}
 	if lastTarget == nil {
@@ -2703,29 +2791,42 @@ func (portal *Portal) handleRemoteReadReceipt(ctx context.Context, source *UserL
 				log.Err(err).Str("target_id", string(targetID)).
 					Msg("Failed to get target message for read receipt")
 				return
-			} else if target != nil && (lastTarget == nil || target.Timestamp.After(lastTarget.Timestamp)) {
+			} else if target != nil && !target.HasFakeMXID() && (lastTarget == nil || target.Timestamp.After(lastTarget.Timestamp)) {
 				lastTarget = target
 			}
 		}
 	}
-	readUpTo := evt.GetReadUpTo()
 	if lastTarget == nil && !readUpTo.IsZero() {
-		lastTarget, err = portal.Bridge.DB.Message.GetLastPartAtOrBeforeTime(ctx, portal.PortalKey, readUpTo)
+		lastTarget, err = portal.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(ctx, portal.PortalKey, readUpTo)
 		if err != nil {
 			log.Err(err).Time("read_up_to", readUpTo).Msg("Failed to get target message for read receipt")
 		}
 	}
-	if lastTarget == nil {
-		log.Warn().Msg("No target message found for read receipt")
-		return
-	}
 	sender := evt.GetSender()
 	intent := portal.GetIntentFor(ctx, sender, source, RemoteEventReadReceipt)
-	err = intent.MarkRead(ctx, portal.MXID, lastTarget.MXID, getEventTS(evt))
-	if err != nil {
-		log.Err(err).Stringer("target_mxid", lastTarget.MXID).Msg("Failed to bridge read receipt")
+	var addTargetLog func(evt *zerolog.Event) *zerolog.Event
+	if lastTarget == nil {
+		sevt, evtOK := evt.(RemoteReadReceiptWithStreamOrder)
+		soIntent, soIntentOK := intent.(StreamOrderReadingMatrixAPI)
+		if !evtOK || !soIntentOK || sevt.GetReadUpToStreamOrder() == 0 {
+			log.Warn().Msg("No target message found for read receipt")
+			return
+		}
+		targetStreamOrder := sevt.GetReadUpToStreamOrder()
+		addTargetLog = func(evt *zerolog.Event) *zerolog.Event {
+			return evt.Int64("target_stream_order", targetStreamOrder)
+		}
+		err = soIntent.MarkStreamOrderRead(ctx, portal.MXID, targetStreamOrder, getEventTS(evt))
 	} else {
-		log.Debug().Stringer("target_mxid", lastTarget.MXID).Msg("Bridged read receipt")
+		addTargetLog = func(evt *zerolog.Event) *zerolog.Event {
+			return evt.Stringer("target_mxid", lastTarget.MXID)
+		}
+		err = intent.MarkRead(ctx, portal.MXID, lastTarget.MXID, getEventTS(evt))
+	}
+	if err != nil {
+		addTargetLog(log.Err(err)).Msg("Failed to bridge read receipt")
+	} else {
+		addTargetLog(log.Debug()).Msg("Bridged read receipt")
 	}
 	if sender.IsFromMe {
 		portal.Bridge.DisappearLoop.StartAll(ctx, portal.MXID)
@@ -2837,17 +2938,57 @@ func (portal *Portal) handleRemoteChatResync(ctx context.Context, source *UserLo
 }
 
 func (portal *Portal) handleRemoteChatDelete(ctx context.Context, source *UserLogin, evt RemoteChatDelete) {
+	log := zerolog.Ctx(ctx)
 	if portal.Receiver == "" && evt.DeleteOnlyForMe() {
-		// TODO check if there are other users
+		logins, err := portal.Bridge.DB.UserPortal.GetAllInPortal(ctx, portal.PortalKey)
+		if err != nil {
+			log.Err(err).Msg("Failed to check if portal has other logins")
+			return
+		}
+		var ownUP *database.UserPortal
+		logins = slices.DeleteFunc(logins, func(up *database.UserPortal) bool {
+			if up.LoginID == source.ID {
+				ownUP = up
+				return true
+			}
+			return false
+		})
+		if len(logins) > 0 {
+			log.Debug().Msg("Not deleting portal with other logins in remote chat delete event")
+			if ownUP != nil {
+				err = portal.Bridge.DB.UserPortal.Delete(ctx, ownUP)
+				if err != nil {
+					log.Err(err).Msg("Failed to delete own user portal row from database")
+				} else {
+					log.Debug().Msg("Deleted own user portal row from database")
+				}
+			}
+			_, err = portal.sendStateWithIntentOrBot(
+				ctx,
+				source.User.DoublePuppet(ctx),
+				event.StateMember,
+				source.UserMXID.String(),
+				&event.Content{Parsed: &event.MemberEventContent{Membership: event.MembershipLeave}},
+				getEventTS(evt),
+			)
+			if err != nil {
+				log.Err(err).Msg("Failed to send leave state event for user after remote chat delete")
+			} else {
+				log.Debug().Msg("Sent leave state event for user after remote chat delete")
+			}
+			return
+		}
 	}
 	err := portal.Delete(ctx)
 	if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to delete portal from database")
+		log.Err(err).Msg("Failed to delete portal from database")
 		return
 	}
 	err = portal.Bridge.Bot.DeleteRoom(ctx, portal.MXID, false)
 	if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to delete Matrix room")
+		log.Err(err).Msg("Failed to delete Matrix room")
+	} else {
+		log.Info().Msg("Deleted room after remote chat delete event")
 	}
 }
 
@@ -2891,7 +3032,8 @@ type ChatMember struct {
 	PowerLevel *int
 	UserInfo   *UserInfo
 
-	PrevMembership event.Membership
+	MemberEventExtra map[string]any
+	PrevMembership   event.Membership
 }
 
 type ChatMemberList struct {
@@ -3248,6 +3390,10 @@ func (portal *Portal) getInitialMemberList(ctx context.Context, members *ChatMem
 	members.PowerLevels.Apply("", pl)
 	members.memberListToMap(ctx)
 	for _, member := range members.MemberMap {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return
+		}
 		if member.Membership != event.MembershipJoin && member.Membership != "" {
 			continue
 		}
@@ -3308,7 +3454,13 @@ func (portal *Portal) updateOtherUser(ctx context.Context, members *ChatMemberLi
 	return false
 }
 
-func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberList, source *UserLogin, sender MatrixAPI, ts time.Time) error {
+func (portal *Portal) syncParticipants(
+	ctx context.Context,
+	members *ChatMemberList,
+	source *UserLogin,
+	sender MatrixAPI,
+	ts time.Time,
+) error {
 	members.memberListToMap(ctx)
 	var loginsInPortal []*UserLogin
 	var err error
@@ -3332,7 +3484,7 @@ func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberL
 	}
 	delete(currentMembers, portal.Bridge.Bot.GetMXID())
 	powerChanged := members.PowerLevels.Apply(portal.Bridge.Bot.GetMXID(), currentPower)
-	syncUser := func(extraUserID id.UserID, member ChatMember, hasIntent bool) bool {
+	syncUser := func(extraUserID id.UserID, member ChatMember, intent MatrixAPI) bool {
 		if member.Membership == "" {
 			member.Membership = event.MembershipJoin
 		}
@@ -3361,16 +3513,24 @@ func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberL
 			Displayname: currentMember.Displayname,
 			AvatarURL:   currentMember.AvatarURL,
 		}
-		wrappedContent := &event.Content{Parsed: content, Raw: make(map[string]any)}
+		wrappedContent := &event.Content{Parsed: content, Raw: maps.Clone(member.MemberEventExtra)}
+		if wrappedContent.Raw == nil {
+			wrappedContent.Raw = make(map[string]any)
+		}
 		thisEvtSender := sender
 		if member.Membership == event.MembershipJoin {
 			content.Membership = event.MembershipInvite
-			if hasIntent {
+			if intent != nil {
 				wrappedContent.Raw["fi.mau.will_auto_accept"] = true
 			}
 			if thisEvtSender.GetMXID() == extraUserID {
 				thisEvtSender = portal.Bridge.Bot
 			}
+		}
+		addLogContext := func(e *zerolog.Event) *zerolog.Event {
+			return e.Stringer("target_user_id", extraUserID).
+				Stringer("sender_user_id", thisEvtSender.GetMXID()).
+				Str("prev_membership", string(currentMember.Membership))
 		}
 		if currentMember != nil && currentMember.Membership == event.MembershipBan && member.Membership != event.MembershipLeave {
 			unbanContent := *content
@@ -3378,41 +3538,46 @@ func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberL
 			wrappedUnbanContent := &event.Content{Parsed: &unbanContent}
 			_, err = portal.sendStateWithIntentOrBot(ctx, thisEvtSender, event.StateMember, extraUserID.String(), wrappedUnbanContent, ts)
 			if err != nil {
-				log.Err(err).
-					Stringer("target_user_id", extraUserID).
-					Stringer("sender_user_id", thisEvtSender.GetMXID()).
-					Str("prev_membership", string(currentMember.Membership)).
-					Str("membership", string(member.Membership)).
+				addLogContext(log.Err(err)).
+					Str("new_membership", string(unbanContent.Membership)).
 					Msg("Failed to unban user to update membership")
 			} else {
-				log.Trace().
-					Stringer("target_user_id", extraUserID).
-					Stringer("sender_user_id", thisEvtSender.GetMXID()).
-					Str("prev_membership", string(currentMember.Membership)).
-					Str("membership", string(member.Membership)).
+				addLogContext(log.Trace()).
+					Str("new_membership", string(unbanContent.Membership)).
 					Msg("Unbanned user to update membership")
+				currentMember.Membership = event.MembershipLeave
 			}
 		}
 		_, err = portal.sendStateWithIntentOrBot(ctx, thisEvtSender, event.StateMember, extraUserID.String(), wrappedContent, ts)
 		if err != nil {
-			log.Err(err).
-				Stringer("target_user_id", extraUserID).
-				Stringer("sender_user_id", thisEvtSender.GetMXID()).
-				Str("prev_membership", string(currentMember.Membership)).
-				Str("membership", string(member.Membership)).
+			addLogContext(log.Err(err)).
+				Str("new_membership", string(content.Membership)).
 				Msg("Failed to update user membership")
 		} else {
-			log.Trace().
-				Stringer("target_user_id", extraUserID).
-				Stringer("sender_user_id", thisEvtSender.GetMXID()).
-				Str("prev_membership", string(currentMember.Membership)).
-				Str("membership", string(member.Membership)).
-				Msg("Updating membership in room")
+			addLogContext(log.Trace()).
+				Str("new_membership", string(content.Membership)).
+				Msg("Updated membership in room")
+			currentMember.Membership = content.Membership
+
+			if intent != nil && content.Membership == event.MembershipInvite && member.Membership == event.MembershipJoin {
+				content.Membership = event.MembershipJoin
+				wrappedJoinContent := &event.Content{Parsed: content, Raw: member.MemberEventExtra}
+				_, err = intent.SendState(ctx, portal.MXID, event.StateMember, intent.GetMXID().String(), wrappedJoinContent, ts)
+				if err != nil {
+					addLogContext(log.Err(err)).
+						Str("new_membership", string(content.Membership)).
+						Msg("Failed to join with intent")
+				} else {
+					addLogContext(log.Trace()).
+						Str("new_membership", string(content.Membership)).
+						Msg("Joined room with intent")
+				}
+			}
 		}
 		return true
 	}
 	syncIntent := func(intent MatrixAPI, member ChatMember) {
-		if !syncUser(intent.GetMXID(), member, true) {
+		if !syncUser(intent.GetMXID(), member, intent) {
 			return
 		}
 		if member.Membership == event.MembershipJoin || member.Membership == "" {
@@ -3425,6 +3590,9 @@ func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberL
 		}
 	}
 	for _, member := range members.MemberMap {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if member.Sender != "" && member.UserInfo != nil {
 			ghost, err := portal.Bridge.GetGhostByID(ctx, member.Sender)
 			if err != nil {
@@ -3438,7 +3606,7 @@ func (portal *Portal) syncParticipants(ctx context.Context, members *ChatMemberL
 			syncIntent(intent, member)
 		}
 		if extraUserID != "" {
-			syncUser(extraUserID, member, false)
+			syncUser(extraUserID, member, nil)
 		}
 	}
 	if powerChanged {
@@ -3764,6 +3932,9 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 	}
 
 	portal.UpdateInfo(ctx, info, source, nil, time.Time{})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	powerLevels := &event.PowerLevelsEventContent{
 		Events: map[string]int{
@@ -3888,7 +4059,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 		}
 		portal.Bridge.WakeupBackfillQueue()
 	}
-	withoutCancelCtx := context.WithoutCancel(ctx)
+	withoutCancelCtx := zerolog.Ctx(ctx).WithContext(portal.Bridge.BackgroundCtx)
 	if portal.Parent != nil {
 		if portal.Parent.MXID != "" {
 			portal.addToParentSpaceAndSave(ctx, true)
@@ -3941,7 +4112,7 @@ func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLo
 			}
 		}
 	}
-	if portal.Bridge.Config.Backfill.Enabled && portal.RoomType != database.RoomTypeSpace {
+	if portal.Bridge.Config.Backfill.Enabled && portal.RoomType != database.RoomTypeSpace && !portal.Bridge.Background {
 		portal.doForwardBackfill(ctx, source, nil, backfillBundle)
 	}
 	return nil

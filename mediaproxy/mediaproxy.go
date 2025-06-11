@@ -8,7 +8,6 @@ package mediaproxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -99,9 +98,8 @@ type GetMediaResponseFile struct {
 type GetMediaFunc = func(ctx context.Context, mediaID string, params map[string]string) (response GetMediaResponse, err error)
 
 type MediaProxy struct {
-	KeyServer *federation.KeyServer
-
-	ForceProxyLegacyFederation bool
+	KeyServer  *federation.KeyServer
+	ServerAuth *federation.ServerAuth
 
 	GetMedia            GetMediaFunc
 	PrepareProxyRequest func(*http.Request)
@@ -139,6 +137,7 @@ func New(serverName string, serverKey string, getMedia GetMediaFunc) (*MediaProx
 type BasicConfig struct {
 	ServerName        string `yaml:"server_name" json:"server_name"`
 	ServerKey         string `yaml:"server_key" json:"server_key"`
+	FederationAuth    bool   `yaml:"federation_auth" json:"federation_auth"`
 	WellKnownResponse string `yaml:"well_known_response" json:"well_known_response"`
 }
 
@@ -149,6 +148,9 @@ func NewFromConfig(cfg BasicConfig, getMedia GetMediaFunc) (*MediaProxy, error) 
 	}
 	if cfg.WellKnownResponse != "" {
 		mp.KeyServer.WellKnownTarget = cfg.WellKnownResponse
+	}
+	if cfg.FederationAuth {
+		mp.EnableServerAuth(nil, nil)
 	}
 	return mp, nil
 }
@@ -170,6 +172,19 @@ func (mp *MediaProxy) GetServerName() string {
 
 func (mp *MediaProxy) GetServerKey() *federation.SigningKey {
 	return mp.serverKey
+}
+
+func (mp *MediaProxy) EnableServerAuth(client *federation.Client, keyCache federation.KeyCache) {
+	if keyCache == nil {
+		keyCache = federation.NewInMemoryCache()
+	}
+	if client == nil {
+		resCache, _ := keyCache.(federation.ResolutionCache)
+		client = federation.NewClient(mp.serverName, mp.serverKey, resCache)
+	}
+	mp.ServerAuth = federation.NewServerAuth(client, keyCache, func(auth federation.XMatrixAuth) string {
+		return mp.GetServerName()
+	})
 }
 
 func (mp *MediaProxy) RegisterRoutes(router *mux.Router) {
@@ -207,16 +222,6 @@ func (mp *MediaProxy) RegisterRoutes(router *mux.Router) {
 	mp.KeyServer.Register(router)
 }
 
-// Deprecated: use mautrix.RespError instead
-type ResponseError struct {
-	Status int
-	Data   any
-}
-
-func (err *ResponseError) Error() string {
-	return fmt.Sprintf("HTTP %d: %v", err.Status, err.Data)
-}
-
 var ErrInvalidMediaIDSyntax = errors.New("invalid media ID syntax")
 
 func queryToMap(vals url.Values) map[string]string {
@@ -231,17 +236,11 @@ func (mp *MediaProxy) getMedia(w http.ResponseWriter, r *http.Request) GetMediaR
 	mediaID := mux.Vars(r)["mediaID"]
 	resp, err := mp.GetMedia(r.Context(), mediaID, queryToMap(r.URL.Query()))
 	if err != nil {
-		//lint:ignore SA1019 deprecated types need to be supported until they're removed
-		var respError *ResponseError
 		var mautrixRespError mautrix.RespError
 		if errors.Is(err, ErrInvalidMediaIDSyntax) {
 			mautrix.MNotFound.WithMessage("This is a media proxy at %q, other media downloads are not available here", mp.serverName).Write(w)
 		} else if errors.As(err, &mautrixRespError) {
 			mautrixRespError.Write(w)
-		} else if errors.As(err, &respError) {
-			w.Header().Add("Content-Type", "application/json")
-			w.WriteHeader(respError.Status)
-			_ = json.NewEncoder(w).Encode(respError.Data)
 		} else {
 			zerolog.Ctx(r.Context()).Err(err).Str("media_id", mediaID).Msg("Failed to get media URL")
 			mautrix.MNotFound.WithMessage("Media not found").Write(w)
@@ -271,9 +270,16 @@ func startMultipart(ctx context.Context, w http.ResponseWriter) *multipart.Write
 }
 
 func (mp *MediaProxy) DownloadMediaFederation(w http.ResponseWriter, r *http.Request) {
+	if mp.ServerAuth != nil {
+		var err *mautrix.RespError
+		r, err = mp.ServerAuth.Authenticate(r)
+		if err != nil {
+			err.Write(w)
+			return
+		}
+	}
 	ctx := r.Context()
 	log := zerolog.Ctx(ctx)
-	// TODO check destination header in X-Matrix auth
 
 	resp := mp.getMedia(w, r)
 	if resp == nil {

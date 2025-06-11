@@ -8,6 +8,7 @@ package bridgev2
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -21,15 +22,17 @@ import (
 type DisappearLoop struct {
 	br        *Bridge
 	NextCheck time.Time
-	stop      context.CancelFunc
+	stop      atomic.Pointer[context.CancelFunc]
 }
 
 const DisappearCheckInterval = 1 * time.Hour
 
 func (dl *DisappearLoop) Start() {
 	log := dl.br.Log.With().Str("component", "disappear loop").Logger()
-	ctx := log.WithContext(context.Background())
-	ctx, dl.stop = context.WithCancel(ctx)
+	ctx, stop := context.WithCancel(log.WithContext(context.Background()))
+	if oldStop := dl.stop.Swap(&stop); oldStop != nil {
+		(*oldStop)()
+	}
 	log.Debug().Msg("Disappearing message loop starting")
 	for {
 		dl.NextCheck = time.Now().Add(DisappearCheckInterval)
@@ -49,8 +52,11 @@ func (dl *DisappearLoop) Start() {
 }
 
 func (dl *DisappearLoop) Stop() {
-	if dl.stop != nil {
-		dl.stop()
+	if dl == nil {
+		return
+	}
+	if stop := dl.stop.Load(); stop != nil {
+		(*stop)()
 	}
 }
 
@@ -79,13 +85,17 @@ func (dl *DisappearLoop) Add(ctx context.Context, dm *database.DisappearingMessa
 			Msg("Failed to save disappearing message")
 	}
 	if !dm.DisappearAt.IsZero() && dm.DisappearAt.Before(dl.NextCheck) {
-		go dl.sleepAndDisappear(context.WithoutCancel(ctx), dm)
+		go dl.sleepAndDisappear(zerolog.Ctx(ctx).WithContext(dl.br.BackgroundCtx), dm)
 	}
 }
 
 func (dl *DisappearLoop) sleepAndDisappear(ctx context.Context, dms ...*database.DisappearingMessage) {
 	for _, msg := range dms {
-		time.Sleep(time.Until(msg.DisappearAt))
+		select {
+		case <-time.After(time.Until(msg.DisappearAt)):
+		case <-ctx.Done():
+			return
+		}
 		resp, err := dl.br.Bot.SendMessage(ctx, msg.RoomID, event.EventRedaction, &event.Content{
 			Parsed: &event.RedactionEventContent{
 				Redacts: msg.EventID,

@@ -38,6 +38,11 @@ bridge:
     # Should room mute status only be synced when creating the portal?
     # Like tags, mutes can't currently be synced back to the remote network.
     mute_only_on_create: true
+    # Should the bridge check the db to ensure that incoming events haven't been handled before
+    deduplicate_matrix_messages: false
+    # Should cross-room reply metadata be bridged?
+    # Most Matrix clients don't support this and servers may reject such messages too.
+    cross_room_replies: false
     # Should the bridge send a `m.replace` instead of `m.room.redaction` event when a message is deleted?
     edit_instead_of_delete: false
     # What should be done to portal rooms when a user logs out or is logged out?
@@ -251,6 +256,9 @@ provisioning:
     allow_matrix_auth: true
     # Enable debug API at /debug with provisioning authentication.
     debug_endpoints: false
+    # Enable session transfers between bridges. Note that this only validates Matrix or shared secret
+    # auth before passing live network client credentials down in the response.
+    enable_session_transfers: false
 
 # Some networks require publicly accessible media download links (e.g. for user avatars when using Discord webhooks).
 # These settings control whether the bridge will provide such public media access.
